@@ -1,0 +1,25 @@
+{
+  "name": "privy-utils",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/index.js",
+    "dev": "tsc -w",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clean": "rm -rf dist"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "A collection of utilities for working with Privy, including a user export tool",
+  "dependencies": {
+    "@privy-io/server-auth": "^1.18.1",
+    "node-fetch": "^2.6.12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "@types/node-fetch": "^2.6.12",
+    "typescript": "^5.3.3"
+  },
+  "type": "module"
+}
