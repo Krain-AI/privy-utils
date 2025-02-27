@@ -1,5 +1,9 @@
 import fs from "fs";
 import fetch from "node-fetch";
+import dotenv from "dotenv";
+
+// Load environment variables from .env file
+dotenv.config();
 
 // Ensure environment is properly set up
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
@@ -20,8 +24,8 @@ const CONFIG = {
   rateLimitMs: 1000,
   // Number of users to process before taking a longer break
   usersBatchSize: 2500,
-  // How long to pause after hitting the batch size (5 minutes)
-  batchCooldownMs: 5 * 60 * 1000,
+  // How long to pause after hitting the batch size (10 seconds instead of 5 minutes)
+  batchCooldownMs: 10 * 1000,
   // Rate limit configuration (30 requests per minute)
   rateLimit: {
     maxRequestsPerMinute: 30,
