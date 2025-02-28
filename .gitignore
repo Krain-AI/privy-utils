@@ -6,8 +6,8 @@ node_modules/
 dist/
 
 # Generated files
-users.csv
-privy_cursor.txt
+*.csv*
+*.txt
 
 # Logs
 *.log

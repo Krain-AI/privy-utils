@@ -11,7 +11,17 @@ const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
 
 // Get configurable file paths from environment variables or use defaults
 const CURSOR_FILE = process.env.CURSOR_FILE || "privy_cursor.txt";
-const USERS_FILE = process.env.OUTPUT_FILE || "users.csv";
+let USERS_FILE = process.env.OUTPUT_FILE || "users.csv";
+const TIMESTAMP_FILE = process.env.TIMESTAMP_FILE || "last_fetch_timestamp.txt";
+
+// Add timestamp to filename if UNIQUE_FILES is set to true
+if (process.env.UNIQUE_FILES === "true") {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filenameParts = USERS_FILE.split(".");
+  const extension = filenameParts.pop();
+  USERS_FILE = `${filenameParts.join(".")}_${timestamp}.${extension}`;
+  console.log(`Using unique filename: ${USERS_FILE}`);
+}
 
 if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
   console.error("Missing required Privy credentials");
@@ -56,6 +66,37 @@ interface PrivyResponse {
 // Add sleep utility function
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Set to store user IDs that have already been processed
+let processedUserIds = new Set<string>();
+
+// Add this function to check if a file exists and load existing user IDs
+function loadExistingUserIds(): void {
+  if (fs.existsSync(USERS_FILE)) {
+    try {
+      console.log(
+        `Loading existing user IDs from ${USERS_FILE} to prevent duplicates...`
+      );
+      const fileContent = fs.readFileSync(USERS_FILE, "utf-8");
+      const lines = fileContent.split("\n");
+
+      // Skip header
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line) {
+          const columns = line.split(",");
+          if (columns.length > 0) {
+            const userId = columns[0].replace(/"/g, "");
+            processedUserIds.add(userId);
+          }
+        }
+      }
+      console.log(`Loaded ${processedUserIds.size} existing user IDs.`);
+    } catch (error) {
+      console.warn(`Error loading existing user IDs: ${error}`);
+    }
+  }
+}
+
 function formatUserToCsvRow(user: PrivyUser): string {
   const emailAccount = user.linked_accounts.find((acc) => acc.type === "email");
   const walletAccount = user.linked_accounts.find(
@@ -78,17 +119,49 @@ function formatUserToCsvRow(user: PrivyUser): string {
 
 function appendUsersToFile(users: PrivyUser[], isFirstBatch: boolean = false) {
   const csv: string[] = [];
+  let newUsers = 0;
+  let duplicates = 0;
 
-  // Add header if this is the first batch
+  // Add header if this is the first batch AND the file doesn't exist or is empty
   if (isFirstBatch) {
-    csv.push("id,createdAt,isGuest,email,wallet,linkedAccounts");
+    let shouldAddHeader = true;
+    try {
+      // Check if file exists and has content
+      if (fs.existsSync(USERS_FILE)) {
+        const stats = fs.statSync(USERS_FILE);
+        if (stats.size > 0) {
+          shouldAddHeader = false;
+        }
+      }
+    } catch (error) {
+      console.warn("Error checking CSV file:", error);
+    }
+
+    if (shouldAddHeader) {
+      csv.push("id,createdAt,isGuest,email,wallet,linkedAccounts");
+    }
   }
 
+  // Only add users that haven't been processed before
   users.forEach((user) => {
-    csv.push(formatUserToCsvRow(user));
+    if (!processedUserIds.has(user.id)) {
+      csv.push(formatUserToCsvRow(user));
+      processedUserIds.add(user.id);
+      newUsers++;
+    } else {
+      duplicates++;
+    }
   });
 
-  fs.appendFileSync(USERS_FILE, csv.join("\n") + "\n");
+  if (csv.length > 0) {
+    fs.appendFileSync(USERS_FILE, csv.join("\n") + "\n");
+  }
+
+  if (duplicates > 0) {
+    console.log(`Skipped ${duplicates} duplicate users.`);
+  }
+
+  return newUsers;
 }
 
 function saveCursor(cursor: string | null) {
@@ -107,9 +180,35 @@ function loadSavedCursor(): string | null {
   return null;
 }
 
-const fetchPageOfUsers = async (cursor?: string): Promise<PrivyResponse> => {
-  const url =
-    "https://auth.privy.io/api/v1/users" + (cursor ? `?cursor=${cursor}` : "");
+function saveTimestamp(timestamp: number) {
+  fs.writeFileSync(TIMESTAMP_FILE, timestamp.toString());
+}
+
+function loadLastFetchTimestamp(): number | null {
+  try {
+    if (fs.existsSync(TIMESTAMP_FILE)) {
+      const timestamp = fs.readFileSync(TIMESTAMP_FILE, "utf-8").trim();
+      return parseInt(timestamp, 10) || null;
+    }
+  } catch (error) {
+    console.warn("Error reading timestamp file:", error);
+  }
+  return null;
+}
+
+const fetchPageOfUsers = async (
+  cursor?: string,
+  since?: number
+): Promise<PrivyResponse> => {
+  let url = "https://auth.privy.io/api/v1/users";
+
+  // Add query parameters
+  const params = new URLSearchParams();
+  if (cursor) params.append("cursor", cursor);
+  if (since) params.append("created_after", since.toString());
+
+  const queryString = params.toString();
+  if (queryString) url += `?${queryString}`;
 
   let retries = 0;
   let backoffMs = CONFIG.rateLimit.initialBackoffMs;
@@ -194,10 +293,11 @@ const fetchPageOfUsers = async (cursor?: string): Promise<PrivyResponse> => {
   }
 };
 
-async function getAllUsers(): Promise<void> {
+async function getAllUsers(sinceTimestamp?: number): Promise<void> {
   let cursor = loadSavedCursor();
   let isFirstBatch = !cursor; // If no cursor, this is the first batch
   let totalUsers = 0;
+  let processedUsers = 0;
 
   try {
     do {
@@ -211,17 +311,20 @@ async function getAllUsers(): Promise<void> {
         await sleep(CONFIG.batchCooldownMs);
       }
 
-      const query = await fetchPageOfUsers(cursor || undefined);
+      const query = await fetchPageOfUsers(cursor || undefined, sinceTimestamp);
 
       if (!query.data || !Array.isArray(query.data)) {
         throw new Error("Invalid response format from Privy API");
       }
 
       if (query.data.length > 0) {
-        appendUsersToFile(query.data, isFirstBatch);
-        totalUsers += query.data.length;
+        const newUsers = appendUsersToFile(query.data, isFirstBatch);
+        processedUsers += query.data.length;
+        totalUsers += newUsers;
         console.log(
-          `Processed ${query.data.length} users (total: ${totalUsers})`
+          `Processed ${query.data.length} users (${newUsers} new, ${
+            query.data.length - newUsers
+          } duplicates, total new: ${totalUsers})`
         );
         isFirstBatch = false;
       }
@@ -249,14 +352,34 @@ async function getAllUsers(): Promise<void> {
 
 async function main(): Promise<void> {
   try {
-    const savedCursor = loadSavedCursor();
-    console.log(
-      savedCursor
-        ? `Resuming user fetch from saved cursor: ${savedCursor}`
-        : "Starting fresh user fetch from Privy..."
-    );
+    // Save the current timestamp at the start of the run
+    const currentTimestamp = Math.floor(Date.now() / 1000);
 
-    await getAllUsers();
+    // Load existing user IDs to prevent duplicates
+    loadExistingUserIds();
+
+    // Check if we should do an incremental fetch
+    const lastFetchTimestamp = loadLastFetchTimestamp();
+    const savedCursor = loadSavedCursor();
+
+    if (process.env.FETCH_NEW_ONLY === "true" && lastFetchTimestamp) {
+      console.log(
+        `Fetching only users created after ${new Date(
+          lastFetchTimestamp * 1000
+        ).toISOString()}`
+      );
+      await getAllUsers(lastFetchTimestamp);
+    } else {
+      console.log(
+        savedCursor
+          ? `Resuming user fetch from saved cursor: ${savedCursor}`
+          : "Starting fresh user fetch from Privy..."
+      );
+      await getAllUsers();
+    }
+
+    // Save the timestamp from when we started this run
+    saveTimestamp(currentTimestamp);
   } catch (error) {
     console.error(
       "Error:",
